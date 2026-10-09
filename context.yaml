@@ -1,0 +1,302 @@
+# THE CONTEXT LAYER
+# Everything the agent knows about the business lives here, not in the prompt.
+# The retriever indexes each entry as one document. Edit this file to teach the agent.
+
+business_rules:
+  - id: rule_academic_year
+    text: >
+      The academic year (AY) runs from 1 April to 31 March. "AY 2025-26" means
+      2025-04-01 to 2026-03-31. "This academic year" means AY 2026-27 (from 2026-04-01).
+  - id: rule_data_window
+    text: >
+      Data covers 2025-04-01 to 2026-09-30. Recent months (August and September 2026)
+      are incomplete for conversion because some leads convert up to 40 days after a demo.
+  - id: rule_centres
+    text: >
+      ONL-01 is the online live-classes "centre". Questions about offline or physical
+      centres must exclude ONL-01. Region "Online" contains only ONL-01.
+  - id: rule_rates
+    text: >
+      Rates and percentages are computed as fractions between 0 and 1 in SQL
+      (multiply by 1.0 to avoid integer division). Round to 4 decimals.
+  - id: rule_personal_data
+    text: >
+      student_name, phone and parent_email are personal data. They must never be
+      selected, filtered on or returned. Count students instead.
+
+tables:
+  - name: centres
+    description: One row per learning centre, including the online "centre" ONL-01.
+    grain: one row per centre
+    columns:
+      centre_id: Centre code, e.g. BLR-01. Primary key.
+      centre_name: Display name, e.g. "Bengaluru - Jayanagar".
+      city: City of the centre (Bengaluru, Hyderabad, Chennai, Pune, Delhi, Kolkata, Online).
+      region: South, West, North, East or Online.
+      opened_date: Date the centre opened.
+      capacity: Maximum students the centre can hold.
+    joins: demo_sessions.centre_id, enrolments.centre_id
+
+  - name: courses
+    description: One row per course the company sells.
+    grain: one row per course
+    columns:
+      course_id: Course code, e.g. JEE-11. Primary key.
+      course_name: Full course name.
+      exam: Target exam. One of JEE, NEET, Foundation.
+      grade: School grade the course is for (9, 10, 11, 12).
+      list_fee_inr: Annual list price in rupees before discounts.
+    joins: leads.course_id, demo_sessions.course_id, enrolments.course_id
+
+  - name: leads
+    description: Every enquiry from a prospective student (top of the admissions funnel).
+    grain: one row per lead
+    columns:
+      lead_id: Lead identifier. Primary key.
+      created_date: Date the enquiry came in.
+      channel: Marketing channel. One of Online Ads, Referral, Walk-in, School Event, Organic Search.
+      city: City the lead came from.
+      course_id: Course the lead was interested in.
+    joins: demo_sessions.lead_id, students.lead_id
+
+  - name: demo_sessions
+    description: Free demo (trial) classes booked by leads. Middle of the admissions funnel.
+    grain: one row per demo booking
+    columns:
+      demo_id: Demo identifier. Primary key.
+      lead_id: The lead who booked the demo.
+      centre_id: Centre where the demo was booked (ONL-01 for online).
+      course_id: Course the demo was for.
+      demo_date: Date of the demo class.
+      attended: TRUE if the lead attended the demo, FALSE if they did not show up.
+    joins: leads.lead_id, centres.centre_id, courses.course_id, students.lead_id
+
+  - name: students
+    description: Leads who became paying students. Contains personal data.
+    grain: one row per student
+    columns:
+      student_id: Student identifier. Primary key.
+      lead_id: The lead this student came from (links back to leads and demo_sessions).
+      student_name: PERSONAL DATA. Never select.
+      phone: PERSONAL DATA. Never select.
+      parent_email: PERSONAL DATA. Never select.
+      city: Home city of the student.
+      grade: School grade.
+      joined_date: Date the student first paid.
+    joins: leads.lead_id, demo_sessions.lead_id, enrolments.student_id
+
+  - name: enrolments
+    description: Paid course enrolments. Source of truth for enrolments, revenue and dropouts.
+    grain: one row per enrolment
+    columns:
+      enrolment_id: Enrolment identifier. Primary key.
+      student_id: The enrolled student.
+      course_id: Course enrolled in.
+      centre_id: Centre the student studies at (ONL-01 for online).
+      mode: online or offline.
+      enrol_date: Date of enrolment and payment.
+      fee_paid_inr: Fee actually paid in rupees after discount. Use for revenue.
+      status: active, dropped or completed.
+      dropout_date: Date the student dropped out. NULL unless status is dropped.
+    joins: students.student_id, courses.course_id, centres.centre_id, attendance_monthly.enrolment_id, test_scores.enrolment_id
+
+  - name: attendance_monthly
+    description: Classes scheduled and attended per enrolment per month.
+    grain: one row per enrolment per month
+    columns:
+      enrolment_id: The enrolment.
+      student_id: The student.
+      month: First day of the month (DATE).
+      classes_scheduled: Classes scheduled that month.
+      classes_attended: Classes the student attended that month.
+    joins: enrolments.enrolment_id
+
+  - name: test_scores
+    description: Monthly test results per subject.
+    grain: one row per enrolment, test date and subject
+    columns:
+      enrolment_id: The enrolment.
+      student_id: The student.
+      test_date: Date of the test.
+      subject: Physics, Chemistry, Maths, Biology or Science.
+      score_pct: Score from 0 to 100.
+    joins: enrolments.enrolment_id
+
+metrics:
+  - name: leads
+    label: Lead count
+    synonyms: [enquiries, inquiries, new leads, lead volume]
+    description: Number of enquiries received, counted by created_date.
+    tables: [leads]
+    sql: COUNT(lead_id) FROM leads, filtered and grouped on leads.created_date
+
+  - name: demo_booking_rate
+    label: Lead-to-demo rate
+    synonyms: [demo booking rate, lead to demo conversion]
+    description: Share of leads who booked at least one demo.
+    tables: [leads, demo_sessions]
+    sql: COUNT(DISTINCT d.lead_id) * 1.0 / COUNT(DISTINCT l.lead_id) FROM leads l LEFT JOIN demo_sessions d ON d.lead_id = l.lead_id
+
+  - name: demo_attendance_rate
+    label: Demo attendance rate
+    synonyms: [show-up rate, demo show rate, trial attendance]
+    description: Share of booked demos that were attended. Counted by demo_date.
+    tables: [demo_sessions]
+    sql: AVG(CASE WHEN attended THEN 1.0 ELSE 0.0 END) FROM demo_sessions
+
+  - name: trial_to_paid_conversion
+    label: Trial-to-paid conversion
+    synonyms: [conversion, conversion rate, demo conversion, trial conversion, demo to enrolment]
+    description: >
+      Share of ATTENDED demos where the lead enrolled within 14 days of the demo date.
+      Counted by demo_date. Denominator is attended demos only.
+    tables: [demo_sessions, students, enrolments]
+    sql: >
+      COUNT(DISTINCT CASE WHEN DATE_DIFF('day', d.demo_date, e.enrol_date) BETWEEN 0 AND 14
+      THEN d.demo_id END) * 1.0 / COUNT(DISTINCT d.demo_id)
+      FROM demo_sessions d LEFT JOIN students s ON s.lead_id = d.lead_id
+      LEFT JOIN enrolments e ON e.student_id = s.student_id
+      WHERE d.attended
+
+  - name: new_enrolments
+    label: New enrolments
+    synonyms: [admissions, sign-ups, new students, enrollments]
+    description: Number of paid enrolments, counted by enrol_date.
+    tables: [enrolments]
+    sql: COUNT(enrolment_id) FROM enrolments, filtered and grouped on enrol_date
+
+  - name: revenue_inr
+    label: Revenue (INR)
+    synonyms: [revenue, sales, collections, fees collected, income]
+    description: Sum of fees actually paid, counted by enrol_date. Use fee_paid_inr, never list_fee_inr.
+    tables: [enrolments]
+    sql: SUM(fee_paid_inr) FROM enrolments
+
+  - name: avg_fee_per_enrolment
+    label: Average fee per enrolment
+    synonyms: [average ticket size, average fee, revenue per student]
+    description: Revenue divided by number of enrolments.
+    tables: [enrolments]
+    sql: SUM(fee_paid_inr) * 1.0 / COUNT(enrolment_id) FROM enrolments
+
+  - name: dropout_rate
+    label: Dropout rate
+    synonyms: [drop-off rate, churn, attrition, drop rate]
+    description: Share of enrolments with status 'dropped', grouped by the enrolment's attributes.
+    tables: [enrolments]
+    sql: AVG(CASE WHEN status = 'dropped' THEN 1.0 ELSE 0.0 END) FROM enrolments
+
+  - name: active_students
+    label: Active students
+    synonyms: [current students, live students, students right now]
+    description: Distinct students with an enrolment whose status is 'active'.
+    tables: [enrolments]
+    sql: COUNT(DISTINCT student_id) FROM enrolments WHERE status = 'active'
+
+  - name: attendance_rate
+    label: Class attendance rate
+    synonyms: [attendance, attendance percentage, class attendance]
+    description: Classes attended divided by classes scheduled. Counted by month.
+    tables: [attendance_monthly]
+    sql: SUM(classes_attended) * 1.0 / SUM(classes_scheduled) FROM attendance_monthly
+
+  - name: avg_test_score
+    label: Average test score
+    synonyms: [test performance, marks, average score, academic performance]
+    description: Mean of score_pct, counted by test_date.
+    tables: [test_scores]
+    sql: AVG(score_pct) FROM test_scores
+
+glossary:
+  - term: trial
+    meaning: A free demo class. "Trial" and "demo" mean the same thing.
+  - term: conversion
+    meaning: Unless stated otherwise, conversion means trial_to_paid_conversion.
+  - term: offline
+    meaning: Centre-based classes, i.e. every centre except ONL-01.
+  - term: batch
+    meaning: Batches are not tracked in this database. The closest unit is course plus centre.
+  - term: funnel
+    meaning: Leads, then demo bookings, then attended demos, then enrolments.
+
+verified_queries:
+  - question: How many new enrolments did we get each month in 2026?
+    sql: |
+      SELECT DATE_TRUNC('month', enrol_date) AS month, COUNT(enrolment_id) AS new_enrolments
+      FROM enrolments
+      WHERE enrol_date >= DATE '2026-01-01' AND enrol_date < DATE '2027-01-01'
+      GROUP BY 1
+      ORDER BY 1
+
+  - question: What was trial-to-paid conversion by centre in August 2026?
+    sql: |
+      SELECT c.centre_name,
+             ROUND(COUNT(DISTINCT CASE WHEN DATE_DIFF('day', d.demo_date, e.enrol_date) BETWEEN 0 AND 14
+                   THEN d.demo_id END) * 1.0 / COUNT(DISTINCT d.demo_id), 4) AS trial_to_paid_conversion
+      FROM demo_sessions d
+      JOIN centres c ON c.centre_id = d.centre_id
+      LEFT JOIN students s ON s.lead_id = d.lead_id
+      LEFT JOIN enrolments e ON e.student_id = s.student_id
+      WHERE d.attended
+        AND d.demo_date >= DATE '2026-08-01' AND d.demo_date < DATE '2026-09-01'
+      GROUP BY 1
+      ORDER BY 2 DESC
+
+  - question: What was revenue by exam in academic year 2025-26?
+    sql: |
+      SELECT co.exam, SUM(e.fee_paid_inr) AS revenue_inr
+      FROM enrolments e
+      JOIN courses co ON co.course_id = e.course_id
+      WHERE e.enrol_date >= DATE '2025-04-01' AND e.enrol_date < DATE '2026-04-01'
+      GROUP BY 1
+      ORDER BY 2 DESC
+
+  - question: Which lead channel has the highest demo attendance rate?
+    sql: |
+      SELECT l.channel,
+             ROUND(AVG(CASE WHEN d.attended THEN 1.0 ELSE 0.0 END), 4) AS demo_attendance_rate,
+             COUNT(*) AS demos_booked
+      FROM demo_sessions d
+      JOIN leads l ON l.lead_id = d.lead_id
+      GROUP BY 1
+      ORDER BY 2 DESC
+
+  - question: What is the dropout rate by course?
+    sql: |
+      SELECT co.course_name,
+             ROUND(AVG(CASE WHEN e.status = 'dropped' THEN 1.0 ELSE 0.0 END), 4) AS dropout_rate,
+             COUNT(*) AS enrolments
+      FROM enrolments e
+      JOIN courses co ON co.course_id = e.course_id
+      GROUP BY 1
+      ORDER BY 2 DESC
+
+  - question: Show the monthly class attendance rate for JEE students.
+    sql: |
+      SELECT a.month,
+             ROUND(SUM(a.classes_attended) * 1.0 / SUM(a.classes_scheduled), 4) AS attendance_rate
+      FROM attendance_monthly a
+      JOIN enrolments e ON e.enrolment_id = a.enrolment_id
+      JOIN courses co ON co.course_id = e.course_id
+      WHERE co.exam = 'JEE'
+      GROUP BY 1
+      ORDER BY 1
+
+  - question: What is the average test score by subject over the last 3 months of data?
+    sql: |
+      SELECT subject, ROUND(AVG(score_pct), 2) AS avg_test_score, COUNT(*) AS tests
+      FROM test_scores
+      WHERE test_date >= DATE '2026-07-01' AND test_date < DATE '2026-10-01'
+      GROUP BY 1
+      ORDER BY 2 DESC
+
+  - question: What does the admissions funnel look like by month (leads, demos, attended, enrolments)?
+    sql: |
+      WITH l AS (SELECT DATE_TRUNC('month', created_date) AS month, COUNT(*) AS leads FROM leads GROUP BY 1),
+           d AS (SELECT DATE_TRUNC('month', demo_date) AS month, COUNT(*) AS demos_booked,
+                        SUM(CASE WHEN attended THEN 1 ELSE 0 END) AS demos_attended
+                 FROM demo_sessions GROUP BY 1),
+           e AS (SELECT DATE_TRUNC('month', enrol_date) AS month, COUNT(*) AS enrolments FROM enrolments GROUP BY 1)
+      SELECT l.month, l.leads, d.demos_booked, d.demos_attended, e.enrolments
+      FROM l LEFT JOIN d USING (month) LEFT JOIN e USING (month)
+      ORDER BY 1
